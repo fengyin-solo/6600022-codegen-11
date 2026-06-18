@@ -2,16 +2,20 @@ import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
 import type {
   ChallengeProgress,
-  ChallengeGroup,
   DailyTask,
   PlayerStats,
   TrainingChallenge,
   ChallengeType,
   ChallengeDifficulty,
 } from '../types';
-import { challengeGroups, trainingChallenges, getChallengeById, getGroupById, getChallengesByGroup } from '../data/trainingData';
+import { challengeGroups, trainingChallenges, getChallengeById, getChallengesByGroup } from '../data/trainingData';
+import {
+  STORAGE_KEY,
+  DEFAULT_UNLOCKED_GROUPS,
+  TYPE_LABELS,
+  DIFFICULTY_LABELS,
+} from '../utils/trainingConstants';
 
-const STORAGE_KEY = 'gobang-training-state';
 const BOARD_SIZE = 15;
 const EMPTY = 0;
 
@@ -41,23 +45,54 @@ function defaultPlayerStats(): PlayerStats {
   };
 }
 
-function loadState(): StoredState {
+function safeLoadState(): StoredState {
+  let parsed: StoredState | null = null;
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
-      const parsed = JSON.parse(raw) as StoredState;
-      if (parsed && parsed.challenges) return parsed;
+      parsed = JSON.parse(raw) as StoredState;
     }
   } catch (_) {
-    // ignore
+    parsed = null;
   }
-  return {
+
+  const result: StoredState = {
     challenges: {},
-    unlockedGroups: ['group-beginner-1'],
+    unlockedGroups: [...DEFAULT_UNLOCKED_GROUPS],
     dailyTasks: [],
     playerStats: defaultPlayerStats(),
     lastDailyRefresh: '',
   };
+
+  if (parsed) {
+    if (parsed.challenges && typeof parsed.challenges === 'object') {
+      result.challenges = parsed.challenges;
+    }
+    if (Array.isArray(parsed.unlockedGroups) && parsed.unlockedGroups.length > 0) {
+      for (const gid of DEFAULT_UNLOCKED_GROUPS) {
+        if (!parsed.unlockedGroups.includes(gid)) {
+          parsed.unlockedGroups.push(gid);
+        }
+      }
+      result.unlockedGroups = parsed.unlockedGroups;
+    }
+    if (Array.isArray(parsed.dailyTasks)) {
+      result.dailyTasks = parsed.dailyTasks;
+    }
+    if (parsed.playerStats && typeof parsed.playerStats === 'object') {
+      result.playerStats = {
+        ...defaultPlayerStats(),
+        ...parsed.playerStats,
+        weaknesses: Array.isArray(parsed.playerStats.weaknesses) ? parsed.playerStats.weaknesses : [],
+        strengths: Array.isArray(parsed.playerStats.strengths) ? parsed.playerStats.strengths : [],
+      };
+    }
+    if (typeof parsed.lastDailyRefresh === 'string') {
+      result.lastDailyRefresh = parsed.lastDailyRefresh;
+    }
+  }
+
+  return result;
 }
 
 function saveState(state: StoredState) {
@@ -70,7 +105,10 @@ function saveState(state: StoredState) {
 
 function generateDailyTasks(date: string, stats: PlayerStats): DailyTask[] {
   const tasks: DailyTask[] = [];
-  const weaknessTypes = stats.weaknesses.length > 0 ? stats.weaknesses : ['checkmate', 'defense', 'tactical'];
+  const weaknessTypes: ChallengeType[] =
+    stats.weaknesses && stats.weaknesses.length > 0
+      ? stats.weaknesses
+      : (['checkmate', 'defense', 'tactical'] as ChallengeType[]);
 
   tasks.push({
     id: `daily-${date}-any`,
@@ -81,20 +119,15 @@ function generateDailyTasks(date: string, stats: PlayerStats): DailyTask[] {
     currentCount: 0,
     reward: 30,
     completed: false,
+    challengeType: undefined,
   });
 
   const focusType = weaknessTypes[0];
-  const typeLabels: Record<ChallengeType, string> = {
-    checkmate: '杀棋',
-    defense: '防守',
-    opening: '布局',
-    tactical: '战术',
-  };
   tasks.push({
-    id: `daily-${date}-${focusType}`,
+    id: `daily-${date}-type-${focusType}`,
     date,
-    title: `专项突破：${typeLabels[focusType]}`,
-    description: `完成 2 道${typeLabels[focusType]}类型的训练题`,
+    title: `专项突破：${TYPE_LABELS[focusType]}`,
+    description: `完成 2 道${TYPE_LABELS[focusType]}类型的训练题`,
     targetCount: 2,
     currentCount: 0,
     reward: 40,
@@ -102,24 +135,25 @@ function generateDailyTasks(date: string, stats: PlayerStats): DailyTask[] {
     challengeType: focusType,
   });
 
-  const diff = stats.totalXP < 100 ? 'easy' : stats.totalXP < 400 ? 'medium' : 'hard';
-  const diffLabels: Record<ChallengeDifficulty, string> = { easy: '简单', medium: '中等', hard: '困难' };
+  const diff: ChallengeDifficulty =
+    stats.totalXP < 100 ? 'easy' : stats.totalXP < 400 ? 'medium' : 'hard';
   tasks.push({
-    id: `daily-${date}-${diff}`,
+    id: `daily-${date}-diff-${diff}`,
     date,
-    title: `难度挑战：${diffLabels[diff]}`,
-    description: `完成 2 道${diffLabels[diff]}难度的训练题`,
+    title: `难度挑战：${DIFFICULTY_LABELS[diff]}`,
+    description: `完成 2 道${DIFFICULTY_LABELS[diff]}难度的训练题`,
     targetCount: 2,
     currentCount: 0,
     reward: 50,
     completed: false,
+    challengeType: undefined,
   });
 
   return tasks;
 }
 
 export const useTrainingStore = defineStore('training', () => {
-  const stored = loadState();
+  const stored = safeLoadState();
 
   const challenges = ref<Record<string, ChallengeProgress>>(stored.challenges);
   const unlockedGroups = ref<string[]>(stored.unlockedGroups);
@@ -133,6 +167,7 @@ export const useTrainingStore = defineStore('training', () => {
   const challengeResult = ref<'idle' | 'correct' | 'wrong'>('idle');
   const currentHintIndex = ref(0);
   const showHint = ref(false);
+  const currentHint = ref<string | null>(null);
 
   function persist() {
     saveState({
@@ -150,7 +185,7 @@ export const useTrainingStore = defineStore('training', () => {
       dailyTasks.value = generateDailyTasks(today, playerStats.value);
       lastDailyRefresh.value = today;
       persist();
-    } else if (dailyTasks.value.length === 0) {
+    } else if (!dailyTasks.value || dailyTasks.value.length === 0) {
       dailyTasks.value = generateDailyTasks(today, playerStats.value);
       persist();
     }
@@ -163,10 +198,12 @@ export const useTrainingStore = defineStore('training', () => {
     return getChallengeById(activeChallengeId.value) || null;
   });
 
-  const isChallengeCompleted = (id: string) => !!challenges.value[id]?.completed;
+  const isChallengeCompleted = (id: string): boolean => {
+    return !!challenges.value[id]?.completed;
+  };
 
   const groupProgress = computed(() => {
-    const result: Record<string, { total: number; completed: number; unlocked: boolean; nextRequired: number; group: ChallengeGroup }> = {};
+    const result: Record<string, { total: number; completed: number; unlocked: boolean; nextRequired: number }> = {};
     for (const g of challengeGroups) {
       const chs = getChallengesByGroup(g.id);
       let completed = 0;
@@ -174,13 +211,13 @@ export const useTrainingStore = defineStore('training', () => {
         if (isChallengeCompleted(c.id)) completed++;
       }
       const unlocked = unlockedGroups.value.includes(g.id);
-      const nextGroup = challengeGroups.find((_, idx) => idx > challengeGroups.indexOf(g));
+      const idx = challengeGroups.indexOf(g);
+      const nextGroup = idx >= 0 && idx < challengeGroups.length - 1 ? challengeGroups[idx + 1] : null;
       result[g.id] = {
         total: chs.length,
         completed,
         unlocked,
         nextRequired: nextGroup ? nextGroup.requiredProgress : 0,
-        group: g,
       };
     }
     return result;
@@ -188,36 +225,78 @@ export const useTrainingStore = defineStore('training', () => {
 
   const recommendedChallenges = computed<TrainingChallenge[]>(() => {
     refreshDailyTasksIfNeeded();
-    const weaknessTypes = playerStats.value.weaknesses.length > 0
-      ? playerStats.value.weaknesses
-      : ['checkmate', 'defense', 'tactical'];
 
-    const candidates: TrainingChallenge[] = [];
+    const allUnlocked: TrainingChallenge[] = [];
     for (const gid of unlockedGroups.value) {
       for (const c of getChallengesByGroup(gid)) {
-        if (!isChallengeCompleted(c.id)) {
-          candidates.push(c);
-        }
+        allUnlocked.push(c);
       }
     }
 
-    if (candidates.length === 0) {
-      return [];
+    if (allUnlocked.length === 0) {
+      const fallback: TrainingChallenge[] = [];
+      for (const gid of DEFAULT_UNLOCKED_GROUPS) {
+        for (const c of getChallengesByGroup(gid)) {
+          fallback.push(c);
+        }
+      }
+      return fallback.slice(0, 3);
     }
 
-    const scored = candidates.map(c => {
+    const uncompleted = allUnlocked.filter(c => !isChallengeCompleted(c.id));
+    const pool = uncompleted.length > 0 ? uncompleted : allUnlocked;
+
+    const weaknessTypes: ChallengeType[] =
+      playerStats.value.weaknesses.length > 0
+        ? playerStats.value.weaknesses
+        : (['checkmate', 'defense', 'tactical'] as ChallengeType[]);
+
+    const scored = pool.map(c => {
       let score = 0;
       if (weaknessTypes.includes(c.type)) score += 3;
       if (c.difficulty === 'easy') score += 1;
       if (playerStats.value.totalXP < 100 && c.difficulty === 'easy') score += 2;
-      if (challenges.value[c.id]) {
-        score += challenges.value[c.id].attempts > 0 ? -1 : 0;
+      const prog = challenges.value[c.id];
+      if (prog) {
+        score += prog.attempts > 0 ? -1 : 0;
+        if (prog.completed) score -= 5;
       }
       return { c, score };
     });
 
     scored.sort((a, b) => b.score - a.score);
     return scored.slice(0, 3).map(s => s.c);
+  });
+
+  const nextChallengeOfActive = computed<TrainingChallenge | null>(() => {
+    if (!activeChallengeId.value) return null;
+
+    const pool: TrainingChallenge[] = [];
+    for (const gid of unlockedGroups.value) {
+      for (const c of getChallengesByGroup(gid)) {
+        pool.push(c);
+      }
+    }
+    const ordered = pool.sort((a, b) => {
+      const ga = challengeGroups.findIndex(gr => gr.id === a.groupId);
+      const gb = challengeGroups.findIndex(gr => gr.id === b.groupId);
+      if (ga !== gb) return ga - gb;
+      return trainingChallenges.indexOf(a) - trainingChallenges.indexOf(b);
+    });
+
+    const idx = ordered.findIndex(c => c.id === activeChallengeId.value);
+    if (idx === -1) return ordered[0] || null;
+    for (let i = idx + 1; i < ordered.length; i++) {
+      if (!isChallengeCompleted(ordered[i].id)) {
+        return ordered[i];
+      }
+    }
+    for (let i = 0; i < ordered.length; i++) {
+      if (!isChallengeCompleted(ordered[i].id)) {
+        return ordered[i];
+      }
+    }
+    return ordered[idx + 1] || ordered[0] || null;
   });
 
   function startChallenge(id: string) {
@@ -229,6 +308,7 @@ export const useTrainingStore = defineStore('training', () => {
     challengeResult.value = 'idle';
     currentHintIndex.value = 0;
     showHint.value = false;
+    currentHint.value = null;
   }
 
   function resetChallenge() {
@@ -238,15 +318,23 @@ export const useTrainingStore = defineStore('training', () => {
     challengeResult.value = 'idle';
     currentHintIndex.value = 0;
     showHint.value = false;
+    currentHint.value = null;
   }
 
   function placeTrainingStone(row: number, col: number): boolean {
     if (!activeChallenge.value) return false;
     if (challengeResult.value === 'correct') return false;
-    if (activeChallengeBoard.value[row]?.[col] !== EMPTY) return false;
+    if (challengeResult.value === 'wrong') {
+      resetChallenge();
+      return false;
+    }
+    if (row < 0 || row >= BOARD_SIZE || col < 0 || col >= BOARD_SIZE) return false;
+    if (!activeChallengeBoard.value[row] || activeChallengeBoard.value[row][col] !== EMPTY) return false;
 
-    activeChallengeBoard.value[row][col] = activeChallenge.value.playerToMove;
-    challengeAttemptMoves.value.push([row, col]);
+    const newBoard = activeChallengeBoard.value.map(r => [...r]);
+    newBoard[row][col] = activeChallenge.value.playerToMove;
+    activeChallengeBoard.value = newBoard;
+    challengeAttemptMoves.value = [...challengeAttemptMoves.value, [row, col]];
 
     const ch = activeChallenge.value;
     const isCorrect = ch.correctMoves.some(([r, c]) => r === row && c === col);
@@ -264,6 +352,7 @@ export const useTrainingStore = defineStore('training', () => {
         };
       }
       challenges.value[ch.id].attempts++;
+      analyzePlayerPerformance();
       persist();
     }
 
@@ -289,22 +378,26 @@ export const useTrainingStore = defineStore('training', () => {
     if (!wasCompleted) {
       playerStats.value.totalXP += ch.reward;
       playerStats.value.totalCompleted++;
+      updateDailyTaskProgress(ch);
+      analyzePlayerPerformance();
+      checkGroupUnlocks();
     }
 
-    updateDailyTaskProgress(ch);
-    analyzePlayerPerformance();
-    checkGroupUnlocks();
     persist();
   }
 
   function updateDailyTaskProgress(ch: TrainingChallenge) {
     refreshDailyTasksIfNeeded();
+    if (!dailyTasks.value) return;
+
     for (const task of dailyTasks.value) {
       if (task.completed) continue;
+
       if (task.challengeType && task.challengeType !== ch.type) continue;
-      if (task.id.includes('easy') && ch.difficulty !== 'easy') continue;
-      if (task.id.includes('medium') && ch.difficulty !== 'medium') continue;
-      if (task.id.includes('hard') && ch.difficulty !== 'hard') continue;
+
+      if (task.id.includes('-diff-easy') && ch.difficulty !== 'easy') continue;
+      if (task.id.includes('-diff-medium') && ch.difficulty !== 'medium') continue;
+      if (task.id.includes('-diff-hard') && ch.difficulty !== 'hard') continue;
 
       if (task.currentCount < task.targetCount) {
         task.currentCount++;
@@ -339,8 +432,8 @@ export const useTrainingStore = defineStore('training', () => {
     const strengths: ChallengeType[] = [];
 
     for (const [t, s] of Object.entries(typeStats) as [ChallengeType, { attempted: number; completed: number }][]) {
-      if (s.attempted >= 3) {
-        const rate = s.completed / s.attempted;
+      if (s.attempted >= 2) {
+        const rate = s.attempted > 0 ? s.completed / s.attempted : 0;
         if (rate < 0.5) weaknesses.push(t);
         if (rate >= 0.8) strengths.push(t);
       }
@@ -353,7 +446,14 @@ export const useTrainingStore = defineStore('training', () => {
   function checkGroupUnlocks() {
     for (const g of challengeGroups) {
       if (!unlockedGroups.value.includes(g.id) && playerStats.value.totalXP >= g.requiredProgress) {
-        unlockedGroups.value.push(g.id);
+        if (!unlockedGroups.value.includes(g.id)) {
+          unlockedGroups.value.push(g.id);
+        }
+      }
+    }
+    for (const gid of DEFAULT_UNLOCKED_GROUPS) {
+      if (!unlockedGroups.value.includes(gid)) {
+        unlockedGroups.value.push(gid);
       }
     }
   }
@@ -364,7 +464,17 @@ export const useTrainingStore = defineStore('training', () => {
     showHint.value = true;
     const hint = activeChallenge.value.hints[currentHintIndex.value];
     currentHintIndex.value++;
+    currentHint.value = hint;
     return hint;
+  }
+
+  function goNextChallenge() {
+    const n = nextChallengeOfActive.value;
+    if (n) {
+      startChallenge(n.id);
+    } else {
+      exitChallenge();
+    }
   }
 
   function exitChallenge() {
@@ -374,30 +484,34 @@ export const useTrainingStore = defineStore('training', () => {
     challengeResult.value = 'idle';
     currentHintIndex.value = 0;
     showHint.value = false;
+    currentHint.value = null;
   }
 
   function updateStatsFromGame(winner: number | null, movesCount: number, playerColor: number) {
     playerStats.value.recentGames++;
+    const total = playerStats.value.recentGames;
     playerStats.value.avgMoves = Math.round(
-      (playerStats.value.avgMoves * (playerStats.value.recentGames - 1) + movesCount) / playerStats.value.recentGames
+      ((playerStats.value.avgMoves || 0) * (total - 1) + (movesCount || 0)) / (total || 1)
     );
     if (winner === playerColor) {
       playerStats.value.recentWins++;
     }
-    if (playerStats.value.recentGames > 0) {
-      playerStats.value.winRate = Math.round((playerStats.value.recentWins / playerStats.value.recentGames) * 100);
+    if (total > 0) {
+      playerStats.value.winRate = Math.round((playerStats.value.recentWins / total) * 100);
     }
     persist();
   }
 
   function resetAllProgress() {
-    challenges.value = {};
-    unlockedGroups.value = ['group-beginner-1'];
-    dailyTasks.value = generateDailyTasks(todayStr(), defaultPlayerStats());
-    playerStats.value = defaultPlayerStats();
-    lastDailyRefresh.value = todayStr();
+    localStorage.removeItem(STORAGE_KEY);
+    const fresh = safeLoadState();
+    challenges.value = fresh.challenges;
+    unlockedGroups.value = fresh.unlockedGroups;
+    dailyTasks.value = fresh.dailyTasks;
+    playerStats.value = fresh.playerStats;
+    lastDailyRefresh.value = fresh.lastDailyRefresh;
     exitChallenge();
-    persist();
+    refreshDailyTasksIfNeeded();
   }
 
   return {
@@ -412,6 +526,8 @@ export const useTrainingStore = defineStore('training', () => {
     challengeResult,
     currentHintIndex,
     showHint,
+    currentHint,
+    nextChallengeOfActive,
     groupProgress,
     recommendedChallenges,
     isChallengeCompleted,
@@ -420,6 +536,7 @@ export const useTrainingStore = defineStore('training', () => {
     resetChallenge,
     placeTrainingStone,
     nextHint,
+    goNextChallenge,
     exitChallenge,
     updateStatsFromGame,
     resetAllProgress,

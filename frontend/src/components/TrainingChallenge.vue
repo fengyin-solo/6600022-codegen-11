@@ -5,8 +5,8 @@
         <div class="flex items-start justify-between mb-3">
           <div>
             <div class="flex items-center gap-2 mb-1">
-              <span class="text-xs px-2 py-0.5 rounded" :class="typeClass(ch!.type)">{{ typeLabel(ch!.type) }}</span>
-              <span class="text-xs px-2 py-0.5 rounded" :class="diffClass(ch!.difficulty)">{{ diffLabel(ch!.difficulty) }}</span>
+              <span class="text-xs px-2 py-0.5 rounded" :class="getTypeClass(ch!.type)">{{ getTypeLabel(ch!.type) }}</span>
+              <span class="text-xs px-2 py-0.5 rounded" :class="getDifficultyClass(ch!.difficulty)">{{ getDifficultyLabel(ch!.difficulty) }}</span>
               <span class="text-xs text-yellow-400">+{{ ch!.reward }} XP</span>
             </div>
             <h3 class="text-lg font-bold text-white">{{ ch!.title }}</h3>
@@ -43,19 +43,19 @@
         <div v-else-if="training.challengeResult === 'wrong'" class="bg-red-900/30 border border-red-600/50 rounded-lg p-3 mb-3">
           <div class="flex items-center gap-2">
             <svg class="w-5 h-5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
-            <span class="text-red-400 font-medium">这步棋不太对，再想想？</span>
+            <span class="text-red-400 font-medium">这步棋不太对，点击棋盘重新尝试</span>
           </div>
         </div>
 
         <div class="flex items-center gap-2 flex-wrap">
           <button
-            @click="showHint()"
+            @click="training.nextHint()"
             class="px-3 py-1.5 bg-blue-900/50 hover:bg-blue-900/70 text-blue-400 border border-blue-600/50 rounded-lg text-sm transition-colors"
-            :disabled="hintIndex >= ch!.hints.length"
+            :disabled="training.currentHintIndex >= ch!.hints.length"
           >
             <span class="flex items-center gap-1">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
-              提示 ({{ hintIndex }}/{{ ch!.hints.length }})
+              提示 ({{ training.currentHintIndex }}/{{ ch!.hints.length }})
             </span>
           </button>
           <button
@@ -76,10 +76,10 @@
           </button>
         </div>
 
-        <div v-if="currentHint" class="mt-3 bg-blue-900/20 border border-blue-600/30 rounded-lg p-3">
+        <div v-if="training.currentHint" class="mt-3 bg-blue-900/20 border border-blue-600/30 rounded-lg p-3">
           <div class="flex items-start gap-2">
             <svg class="w-4 h-4 text-blue-400 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
-            <p class="text-sm text-blue-300">{{ currentHint }}</p>
+            <p class="text-sm text-blue-300">{{ training.currentHint }}</p>
           </div>
         </div>
       </div>
@@ -98,7 +98,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch, nextTick } from 'vue';
 import { useTrainingStore } from '../store/training';
-import { trainingChallenges } from '../data/trainingData';
+import { getTypeLabel, getDifficultyLabel, getTypeClass, getDifficultyClass } from '../utils/trainingConstants';
 
 const training = useTrainingStore();
 const canvasRef = ref<HTMLCanvasElement | null>(null);
@@ -109,29 +109,13 @@ const PADDING = 30;
 const canvasSize = CELL_SIZE * (BOARD_SIZE - 1) + PADDING * 2;
 
 const ch = computed(() => training.activeChallenge);
-const hintIndex = computed(() => training.currentHintIndex);
-const currentHint = ref<string | null>(null);
 const attempts = computed(() => {
   if (!ch.value) return 0;
   return training.challenges[ch.value.id]?.attempts || 0;
 });
 
-function showHint() {
-  const hint = training.nextHint();
-  if (hint) {
-    currentHint.value = hint;
-  }
-}
-
 function nextChallenge() {
-  if (!ch.value) return;
-  const idx = trainingChallenges.findIndex(c => c.id === ch.value!.id);
-  const next = trainingChallenges[idx + 1];
-  if (next) {
-    training.startChallenge(next.id);
-  } else {
-    training.exitChallenge();
-  }
+  training.goNextChallenge();
 }
 
 function drawBoard(ctx: CanvasRenderingContext2D) {
@@ -232,14 +216,15 @@ function render() {
 
 function handleClick(e: MouseEvent) {
   if (!ch.value) return;
-  if (training.challengeResult === 'correct') return;
 
   const canvas = canvasRef.value;
   if (!canvas) return;
 
   const rect = canvas.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
+  const scaleX = canvasSize / rect.width;
+  const scaleY = canvasSize / rect.height;
+  const mx = (e.clientX - rect.left) * scaleX;
+  const my = (e.clientY - rect.top) * scaleY;
 
   const col = Math.round((mx - PADDING) / CELL_SIZE);
   const row = Math.round((my - PADDING) / CELL_SIZE);
@@ -249,55 +234,17 @@ function handleClick(e: MouseEvent) {
   training.placeTrainingStone(row, col);
 }
 
-function typeLabel(t: string): string {
-  const map: Record<string, string> = {
-    checkmate: '杀棋',
-    defense: '防守',
-    opening: '布局',
-    tactical: '战术',
-  };
-  return map[t] || t;
-}
 
-function diffLabel(d: string): string {
-  const map: Record<string, string> = {
-    easy: '简单',
-    medium: '中等',
-    hard: '困难',
-  };
-  return map[d] || d;
-}
-
-function typeClass(t: string): string {
-  const map: Record<string, string> = {
-    checkmate: 'bg-red-900/50 text-red-400',
-    defense: 'bg-blue-900/50 text-blue-400',
-    opening: 'bg-purple-900/50 text-purple-400',
-    tactical: 'bg-orange-900/50 text-orange-400',
-  };
-  return map[t] || 'bg-gray-800 text-gray-400';
-}
-
-function diffClass(d: string): string {
-  const map: Record<string, string> = {
-    easy: 'bg-green-900/50 text-green-400',
-    medium: 'bg-yellow-900/50 text-yellow-400',
-    hard: 'bg-red-900/50 text-red-400',
-  };
-  return map[d] || 'bg-gray-800 text-gray-400';
-}
 
 onMounted(() => {
   nextTick(() => render());
 });
 
 watch(
-  [() => training.activeChallengeBoard, () => training.challengeResult, () => training.activeChallengeId],
+  [() => training.activeChallengeBoard, () => training.challengeResult, () => training.activeChallengeId, () => training.challengeAttemptMoves],
   () => {
     nextTick(() => render());
-    if (training.challengeResult !== 'wrong') {
-      currentHint.value = null;
-    }
-  }
+  },
+  { deep: true }
 );
 </script>
